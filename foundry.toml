@@ -1,0 +1,35 @@
+# IZKONEN — конфигурация на проекта (Foundry)
+# Тук се задават основните настройки за компилиране и мрежите.
+
+[profile.default]
+src = "src"                 # тук стоят контрактите (.sol)
+out = "out"                 # тук се събира компилираният резултат
+libs = ["lib"]              # външни библиотеки (OpenZeppelin)
+test = "test"               # тук стоят тестовете
+script = "script"           # тук стоят скриптовете за деплой
+solc = "0.8.26"             # версия на компилатора (заключена)
+evm_version = "cancun"      # EVM версия (както в бялата книга)
+optimizer = true
+optimizer_runs = 200
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "forge-std/=lib/forge-std/src/",
+]
+
+# Настройки за fuzz/инвариант тестовете (колко произволни случая да пробва)
+[fuzz]
+runs = 256
+
+[invariant]
+runs = 256
+depth = 15
+
+# Мрежи (адресите се задават през environment променливи, НЕ се пишат тук)
+[rpc_endpoints]
+base = "${BASE_RPC_URL}"
+base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
+
+# За проверка на кода в BaseScan (ключът се задава през environment, НЕ се пише тук)
+[etherscan]
+base = { key = "${BASESCAN_API_KEY}", chain = 8453 }
+base_sepolia = { key = "${BASESCAN_API_KEY}", chain = 84532 }
