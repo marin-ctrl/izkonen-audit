@@ -62,6 +62,14 @@ contract IZKONENMinter is AccessControl {
 
     uint256 private constant BPS_DENOMINATOR = 10_000;
 
+    /// @notice How far in the past `startTime_` may be set on a FIRST deployment.
+    /// @dev Audit fix Informational-03 (Kann Audits, 2026-08-14): without a bound,
+    ///      a mistyped or stale `startTime_` could open several tranche windows
+    ///      immediately at deployment. The window is deliberately small but not
+    ///      zero, so a deployment prepared and signed through the timelock a few
+    ///      days earlier still succeeds.
+    uint256 public constant START_TIME_GRACE_PERIOD = 7 days;
+
     /// @notice One-time day-one liquidity minted at launch (whitepaper §10.6a).
     ///         Carved out of the schedule: the 2048 tranche is reduced by this
     ///         same amount, so tranches + initial liquidity == MAX_SUPPLY exactly
@@ -123,6 +131,9 @@ contract IZKONENMinter is AccessControl {
     error WindowNotOpen(uint256 yearIndex, uint256 opensAt);
     error ZeroAddress();
     error BadStartingIndex();
+    /// @dev Reverts when a FIRST deployment is given a `startTime_` in the future
+    ///      or further than START_TIME_GRACE_PERIOD in the past (audit fix I-03).
+    error BadStartTime(uint256 startTime, uint256 nowTimestamp);
     error InitialLiquidityAlreadyMinted();
     /// @dev Reverts if a configured mint recipient (emission recipient OR treasury,
     ///      in the constructor or in a setter) is not exempt from the token's
@@ -157,6 +168,22 @@ contract IZKONENMinter is AccessControl {
             emissionRecipient_ == address(0)
         ) revert ZeroAddress();
         if (startingYearIndex_ > TOTAL_YEARS) revert BadStartingIndex();
+
+        // Audit fix I-03 (Kann Audits): bound `startTime_` on a FIRST deployment.
+        // A replacement minter (startingYearIndex_ > 0) must keep the ORIGINAL
+        // start so the yearly windows stay aligned, and that value is legitimately
+        // far in the past — so the bound is applied only to the first minter.
+        // The second half of the auditor's recommendation — deriving startTime_
+        // from the retired minter on-chain instead of accepting it as input —
+        // belongs to the replacement module, which does not exist yet; it is
+        // recorded as a mandatory requirement in the migration runbook together
+        // with findings Informational-02, -04 and -05.
+        if (startingYearIndex_ == 0) {
+            if (
+                startTime_ > block.timestamp ||
+                startTime_ + START_TIME_GRACE_PERIOD < block.timestamp
+            ) revert BadStartTime(startTime_, block.timestamp);
+        }
 
         // Audit fix T-3 (finding L-1): both mint recipients must already be
         // exempt from the token's MAX_WALLET limit, otherwise a future mint()
