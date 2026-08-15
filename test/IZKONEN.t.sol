@@ -25,7 +25,16 @@ contract IZKONENTest is Test {
     address internal bob = makeAddr("bob");
 
     uint256 internal constant MAX_SUPPLY = 38_690_000_000_000 * 1e18;
-    uint256 internal constant MAX_WALLET = 1_160_700_000_000 * 1e18; // 3%
+    /// @dev Audit fix Low-01: the anti-whale limit is no longer a fixed constant.
+    ///      It is 3% of the CIRCULATING supply, so tests must establish a supply
+    ///      before they can reason about the limit at all.
+    uint256 internal constant MAX_WALLET_BPS = 300;
+
+    /// @dev Supply seeded into the EXEMPT treasury before any non-exempt address
+    ///      receives tokens. This mirrors the real launch flow: the initial
+    ///      liquidity (38.5B IZK) is minted to addresses the minter's constructor
+    ///      has already verified as exempt.
+    uint256 internal constant SEED_SUPPLY = 38_500_000_000 * 1e18;
 
     function setUp() public {
         token = new IZKONEN(admin, treasury);
@@ -34,6 +43,14 @@ contract IZKONENTest is Test {
         bytes32 minterRole = token.MINTER_ROLE(); // cached BEFORE prank (forge >=1.4: staticcalls consume pranks)
         vm.prank(admin);
         token.grantRole(minterRole, address(this));
+    }
+
+    /// @dev Seeds circulating supply into the exempt treasury and returns the
+    ///      resulting max-wallet limit. Because the treasury is exempt, this is
+    ///      the only way a supply can exist before non-exempt holders appear.
+    function _seedSupply() internal returns (uint256 limit) {
+        token.mint(treasury, SEED_SUPPLY);
+        limit = token.maxWallet();
     }
 
     // ------------------------------------------------------------------
@@ -49,7 +66,18 @@ contract IZKONENTest is Test {
 
     function test_Constants() public view {
         assertEq(token.MAX_SUPPLY(), MAX_SUPPLY);
-        assertEq(token.MAX_WALLET(), MAX_WALLET);
+        assertEq(token.MAX_WALLET_BPS(), MAX_WALLET_BPS);
+        // Nothing minted yet, so 3% of nothing is nothing.
+        assertEq(token.maxWallet(), 0);
+    }
+
+    /// @dev Audit fix Low-01: the limit must track the circulating supply.
+    function test_MaxWalletGrowsWithSupply() public {
+        uint256 limit1 = _seedSupply();
+        assertEq(limit1, (SEED_SUPPLY * MAX_WALLET_BPS) / 10_000);
+
+        token.mint(treasury, SEED_SUPPLY); // supply doubles
+        assertEq(token.maxWallet(), limit1 * 2);
     }
 
     function test_AdminRolesAndExemptions() public view {
@@ -73,9 +101,31 @@ contract IZKONENTest is Test {
     // ------------------------------------------------------------------
 
     function test_MinterCanMint() public {
-        token.mint(alice, 1_000 * 1e18);
-        assertEq(token.balanceOf(alice), 1_000 * 1e18);
+        // Minted to the exempt treasury: with a supply-relative limit the first
+        // tokens must go to an exempt address (see test_FirstMintMustGoToExempt).
+        token.mint(treasury, 1_000 * 1e18);
+        assertEq(token.balanceOf(treasury), 1_000 * 1e18);
         assertEq(token.totalSupply(), 1_000 * 1e18);
+    }
+
+    /**
+     * @dev Consequence of audit fix Low-01, asserted deliberately rather than
+     *      discovered later: while totalSupply() is 0, any non-exempt receiver
+     *      would hold 100% of the supply, which is above 3%. The first tokens
+     *      therefore MUST be minted to an exempt address. The minter enforces
+     *      exactly this — its constructor reverts unless both the treasury and
+     *      the emission recipient are already exempt (earlier audit fix T-3).
+     */
+    function test_FirstMintMustGoToExempt() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IZKONEN.MaxWalletExceeded.selector,
+                alice,
+                1_000 * 1e18,
+                0
+            )
+        );
+        token.mint(alice, 1_000 * 1e18);
     }
 
     function test_NonMinterCannotMint() public {
@@ -125,7 +175,11 @@ contract IZKONENTest is Test {
     // ------------------------------------------------------------------
 
     function test_PauseBlocksTransfers() public {
-        token.mint(alice, 100 * 1e18);
+        // Supply must exist before a non-exempt address can hold anything
+        // (audit fix Low-01: the limit is 3% of circulating supply).
+        _seedSupply();
+        vm.prank(treasury);
+        token.transfer(alice, 100 * 1e18);
 
         vm.prank(admin);
         token.pause();
@@ -136,7 +190,9 @@ contract IZKONENTest is Test {
     }
 
     function test_UnpauseRestoresTransfers() public {
-        token.mint(alice, 100 * 1e18);
+        _seedSupply();
+        vm.prank(treasury);
+        token.transfer(alice, 100 * 1e18);
 
         vm.prank(admin);
         token.pause();
@@ -165,52 +221,73 @@ contract IZKONENTest is Test {
     // Anti-whale (3% max wallet)
     // ------------------------------------------------------------------
 
+    /**
+     * @dev NOTE on why these tests move tokens with transfer() rather than mint().
+     *      After audit fix Low-01 the limit is 3% of totalSupply(), evaluated
+     *      AFTER the transfer. A mint raises the supply and therefore raises the
+     *      limit in the same transaction, so the exact boundary of a mint is
+     *      3%/97% of the pre-existing supply. A transfer leaves the supply
+     *      untouched, so the boundary is exactly the limit. Transfers are used
+     *      wherever the test asserts the boundary precisely.
+     */
     function test_MaxWalletBlocksWhale() public {
-        // Minting just over the cap to a NON-exempt wallet must revert.
+        uint256 limit = _seedSupply();
+
+        vm.prank(treasury);
         vm.expectRevert(
             abi.encodeWithSelector(
                 IZKONEN.MaxWalletExceeded.selector,
                 alice,
-                MAX_WALLET + 1,
-                MAX_WALLET
+                limit + 1,
+                limit
             )
         );
-        token.mint(alice, MAX_WALLET + 1);
+        token.transfer(alice, limit + 1);
     }
 
     function test_MaxWalletAllowsExactLimit() public {
-        token.mint(alice, MAX_WALLET); // exactly 3% is allowed
-        assertEq(token.balanceOf(alice), MAX_WALLET);
+        uint256 limit = _seedSupply();
+
+        vm.prank(treasury);
+        token.transfer(alice, limit); // exactly 3% of supply is allowed
+        assertEq(token.balanceOf(alice), limit);
     }
 
     function test_MaxWalletBlocksTransferPushingOverLimit() public {
-        token.mint(alice, MAX_WALLET); // alice at the limit
-        token.mint(bob, 10 * 1e18);
+        uint256 limit = _seedSupply();
 
-        vm.prank(bob);
+        vm.prank(treasury);
+        token.transfer(alice, limit); // alice sits exactly at the limit
+
+        vm.prank(treasury);
         vm.expectRevert(
             abi.encodeWithSelector(
                 IZKONEN.MaxWalletExceeded.selector,
                 alice,
-                MAX_WALLET + 1e18,
-                MAX_WALLET
+                limit + 1,
+                limit
             )
         );
-        token.transfer(alice, 1e18);
+        token.transfer(alice, 1); // one wei more must fail
     }
 
     function test_ExemptAddressCanHoldMoreThanLimit() public {
-        // treasury is exempt from construction — can exceed 3%.
-        token.mint(treasury, MAX_WALLET + 1_000 * 1e18);
-        assertEq(token.balanceOf(treasury), MAX_WALLET + 1_000 * 1e18);
+        // treasury is exempt from construction — it holds 100% of the supply,
+        // far above 3%, and that is intended.
+        uint256 limit = _seedSupply();
+        assertEq(token.balanceOf(treasury), SEED_SUPPLY);
+        assertGt(token.balanceOf(treasury), limit);
     }
 
     function test_GovernanceCanAddExemption() public {
+        uint256 limit = _seedSupply();
+
         vm.prank(admin);
         token.setMaxWalletExempt(alice, true);
 
-        token.mint(alice, MAX_WALLET + 5_000 * 1e18); // now allowed
-        assertEq(token.balanceOf(alice), MAX_WALLET + 5_000 * 1e18);
+        vm.prank(treasury);
+        token.transfer(alice, limit + 5_000 * 1e18); // now allowed
+        assertEq(token.balanceOf(alice), limit + 5_000 * 1e18);
     }
 
     function test_OnlyAdminCanSetExemption() public {
@@ -231,13 +308,16 @@ contract IZKONENTest is Test {
     // ------------------------------------------------------------------
 
     function test_DisableMaxWalletLetsAnyoneHoldAnything() public {
+        uint256 limit = _seedSupply();
+
         vm.prank(admin);
         token.disableMaxWallet();
         assertFalse(token.maxWalletEnabled());
 
-        // Now a non-exempt wallet can exceed the old 3% limit.
-        token.mint(alice, MAX_WALLET + 100 * 1e18);
-        assertEq(token.balanceOf(alice), MAX_WALLET + 100 * 1e18);
+        // Now a non-exempt wallet can exceed the 3% limit.
+        vm.prank(treasury);
+        token.transfer(alice, limit + 100 * 1e18);
+        assertEq(token.balanceOf(alice), limit + 100 * 1e18);
     }
 
     function test_DisableMaxWalletIsOneWay() public {
@@ -271,7 +351,9 @@ contract IZKONENTest is Test {
     // addition would break compilation of this expectation:
     // a normal transfer between two ordinary wallets always works.
     function test_NoBlacklist_OrdinaryTransferAlwaysWorks() public {
-        token.mint(alice, 10 * 1e18);
+        _seedSupply();
+        vm.prank(treasury);
+        token.transfer(alice, 10 * 1e18);
         vm.prank(alice);
         token.transfer(bob, 10 * 1e18);
         assertEq(token.balanceOf(bob), 10 * 1e18);
